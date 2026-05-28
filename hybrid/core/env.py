@@ -1,0 +1,340 @@
+"""Minimal game environment (gym-like, no gym dependency)."""
+
+from __future__ import annotations
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
+
+from .types import Side, PieceKind, Piece, Move
+from .board import Board, initial_board
+from .rules import apply_move, generate_legal_moves, terminal_info, GameInfo, TerminalStatus, board_hash
+from .rules import _active_variant as _rules_active_variant  # noqa: F401
+import hybrid.core.rules as _rules_module
+from .config import MAX_PLIES, ENABLE_THREEFOLD_REPETITION_DRAW, BOARD_W, BOARD_H, VariantConfig, DEFAULT_VARIANT
+
+
+@dataclass
+class GameState:
+    board: Board
+    side_to_move: Side
+    ply: int = 0  # half-move count
+    repetition: Dict[str, int] = field(default_factory=dict)
+
+    def clone(self) -> "GameState":
+        return GameState(
+            board=self.board.clone(),
+            side_to_move=self.side_to_move,
+            ply=self.ply,
+            repetition=dict(self.repetition),
+        )
+
+
+# ═══════════════════════════════════════════════════════════════
+# C++ engine helpers (lazy-imported only when use_cpp=True)
+#
+# We do not import the pybind11 extension at module import time. Two reasons:
+# (1) the extension does not always build cleanly on every machine, so users who
+# only need the pure-Python path should still be able to ``import hybrid.core``.
+# (2) tests sometimes monkeypatch rule flags before the C++ module is touched,
+# so deferring the import keeps the import order out of the test surface.
+# Bidirectional kind/side maps live as module-level globals; they are populated
+# on the first ``_ensure_cpp_maps()`` call and reused for the lifetime of the
+# process.
+# ═══════════════════════════════════════════════════════════════
+
+_PY_TO_CPP_SIDE = None
+_PY_TO_CPP_KIND = None
+_CPP_TO_PY_KIND = None
+_cpp_module = None
+
+
+def _ensure_cpp_maps():
+    """Populate the Python <-> C++ type maps on first use, no-op afterwards."""
+    global _PY_TO_CPP_SIDE, _PY_TO_CPP_KIND, _CPP_TO_PY_KIND, _cpp_module
+    if _cpp_module is not None:
+        return
+
+    from types import SimpleNamespace
+    from hybrid.cpp_engine import (
+        Side as CppSide,
+        PieceKind as CppPieceKind,
+        Piece as CppPiece,
+        Move as CppMove,
+        Board as CppBoard,
+        generate_legal_moves as cpp_gen_legal,
+        apply_move as cpp_apply,
+        terminal_info as cpp_term_info,
+        is_in_check as cpp_is_in_check,
+    )
+
+    _PY_TO_CPP_SIDE = {Side.CHESS: CppSide.CHESS, Side.XIANGQI: CppSide.XIANGQI}
+
+    _PY_TO_CPP_KIND = {
+        PieceKind.KING: CppPieceKind.KING, PieceKind.QUEEN: CppPieceKind.QUEEN,
+        PieceKind.ROOK: CppPieceKind.ROOK, PieceKind.BISHOP: CppPieceKind.BISHOP,
+        PieceKind.KNIGHT: CppPieceKind.KNIGHT, PieceKind.PAWN: CppPieceKind.PAWN,
+        PieceKind.GENERAL: CppPieceKind.GENERAL, PieceKind.ADVISOR: CppPieceKind.ADVISOR,
+        PieceKind.ELEPHANT: CppPieceKind.ELEPHANT, PieceKind.HORSE: CppPieceKind.HORSE,
+        PieceKind.CHARIOT: CppPieceKind.CHARIOT, PieceKind.CANNON: CppPieceKind.CANNON,
+        PieceKind.SOLDIER: CppPieceKind.SOLDIER,
+        PieceKind.XQ_QUEEN: CppPieceKind.XQ_QUEEN,
+    }
+
+    _CPP_TO_PY_KIND = {v: k for k, v in _PY_TO_CPP_KIND.items()}
+
+    _cpp_module = SimpleNamespace(
+        CppSide=CppSide,
+        CppPieceKind=CppPieceKind,
+        CppPiece=CppPiece,
+        CppMove=CppMove,
+        CppBoard=CppBoard,
+        gen_legal=cpp_gen_legal,
+        apply_move=cpp_apply,
+        terminal_info=cpp_term_info,
+        is_in_check=cpp_is_in_check,
+    )
+
+
+def _sync_to_cpp(py_board: Board):
+    """Create a C++ Board from a Python Board."""
+    _ensure_cpp_maps()
+    cpp_board = _cpp_module.CppBoard.empty()
+    for x, y, p in py_board.iter_pieces():
+        cpp_board.set(x, y, _cpp_module.CppPiece(
+            _PY_TO_CPP_KIND[p.kind], _PY_TO_CPP_SIDE[p.side]
+        ))
+    return cpp_board
+
+
+def _sync_to_py(cpp_board) -> Board:
+    """Create a Python Board from a C++ Board."""
+    py_board = Board.empty()
+    for x, y, p in cpp_board.iter_pieces():
+        py_board.set(x, y, Piece(_CPP_TO_PY_KIND[p.kind],
+                                  Side.CHESS if p.side == _cpp_module.CppSide.CHESS else Side.XIANGQI))
+    return py_board
+
+
+def _cpp_to_py_move(cm) -> Move:
+    """Convert a C++ Move to a Python Move."""
+    promo = None
+    if cm.promotion != _cpp_module.CppPieceKind.NONE:
+        promo = _CPP_TO_PY_KIND[cm.promotion]
+    return Move(cm.fx, cm.fy, cm.tx, cm.ty, promo)
+
+
+def _py_to_cpp_move(pm: Move):
+    """Convert a Python Move to a C++ Move."""
+    _ensure_cpp_maps()
+    promo = _cpp_module.CppPieceKind.NONE
+    if pm.promotion is not None:
+        promo = _PY_TO_CPP_KIND[pm.promotion]
+    return _cpp_module.CppMove(pm.fx, pm.fy, pm.tx, pm.ty, promo)
+
+
+class HybridChessEnv:
+    """Hybrid chess game environment.
+
+    Args:
+        max_plies: Maximum half-moves before forced draw.
+        use_cpp: Use C++ engine for game logic.
+        variant: Game variant configuration. Controls piece setup and rules.
+
+    Example::
+
+        from hybrid.core.config import VariantConfig
+        env = HybridChessEnv(variant=VariantConfig(no_queen=True))
+        state = env.reset()  # board has no Chess Queen
+    """
+
+    def __init__(self, max_plies: int = MAX_PLIES, use_cpp: bool = False,
+                 variant: VariantConfig = DEFAULT_VARIANT):
+        if max_plies <= 0:
+            raise ValueError("max_plies must be > 0")
+        self.max_plies = max_plies
+        self.use_cpp = use_cpp
+        self.variant = variant
+        self.state: Optional[GameState] = None
+        self._cpp_board = None
+        self._cpp_side = None
+
+        if use_cpp:
+            _ensure_cpp_maps()
+
+    def set_max_plies(self, max_plies: int) -> None:
+        """Update the move limit (for self-play compute budgeting)."""
+        if max_plies <= 0:
+            raise ValueError("max_plies must be > 0")
+        self.max_plies = max_plies
+
+    def _init_cpp_state(self, py_board: Board, side: Side) -> None:
+        """Sync C++ board from Python board."""
+        self._cpp_board = _sync_to_cpp(py_board)
+        self._cpp_side = _PY_TO_CPP_SIDE[side]
+
+    def _set_active_variant(self) -> None:
+        """Set the module-level active variant so rules functions use our config."""
+        _rules_module._active_variant = self.variant
+        # Sync rule flags to C++ engine
+        if self.use_cpp:
+            _ensure_cpp_maps()
+            from hybrid.cpp_engine import RuleFlags as CppRuleFlags, set_rule_flags
+            flags = CppRuleFlags()
+            flags.no_queen_promotion = self.variant.no_queen_promotion
+            flags.no_promotion = self.variant.no_promotion
+            flags.chess_palace = self.variant.chess_palace
+            flags.knight_block = self.variant.knight_block
+            set_rule_flags(flags)
+
+    def reset(self) -> GameState:
+        self._set_active_variant()
+        b = initial_board(variant=self.variant)
+        s = GameState(board=b, side_to_move=Side.CHESS, ply=0, repetition={})
+        if ENABLE_THREEFOLD_REPETITION_DRAW:
+            key = board_hash(s.board, s.side_to_move)
+            s.repetition[key] = s.repetition.get(key, 0) + 1
+        self.state = s
+
+        if self.use_cpp:
+            self._init_cpp_state(b, Side.CHESS)
+
+        return s.clone()
+
+    def reset_from_board(self, board: Board, side_to_move: Side) -> GameState:
+        """Reset to a custom board position (for endgame curriculum learning)."""
+        self._set_active_variant()
+        s = GameState(board=board.clone(), side_to_move=side_to_move, ply=0, repetition={})
+        if ENABLE_THREEFOLD_REPETITION_DRAW:
+            key = board_hash(s.board, s.side_to_move)
+            s.repetition[key] = s.repetition.get(key, 0) + 1
+        self.state = s
+
+        if self.use_cpp:
+            self._init_cpp_state(board, side_to_move)
+
+        return s.clone()
+
+    def reset_from_fen(self, fen: str) -> GameState:
+        """Reset to a position specified by a FEN-like string.
+
+        See ``hybrid.core.fen`` for the notation format.
+        """
+        from .fen import parse_fen
+        board, side = parse_fen(fen)
+        return self.reset_from_board(board, side)
+
+    def legal_moves(self) -> List[Move]:
+        assert self.state is not None
+        if self.use_cpp:
+            cpp_moves = _cpp_module.gen_legal(self._cpp_board, self._cpp_side)
+            return [_cpp_to_py_move(cm) for cm in cpp_moves]
+        return generate_legal_moves(self.state.board, self.state.side_to_move)
+
+    def step(self, mv: Move) -> Tuple[GameState, float, bool, GameInfo]:
+        """Execute one move.
+
+        Returns (next_state, reward, done, info).
+        Reward is from the *moving* side's perspective (+1 win, -1 loss, 0 draw/ongoing).
+        """
+        assert self.state is not None
+        s = self.state
+
+        if self.use_cpp:
+            return self._step_cpp(mv)
+
+        # ── Python path (unchanged) ──
+        legal = self.legal_moves()
+        if mv not in legal:
+            raise ValueError(f"Illegal move: {mv} for side {s.side_to_move}")
+
+        nb = apply_move(s.board, mv)
+        next_side = s.side_to_move.opponent()
+        next_state = GameState(board=nb, side_to_move=next_side, ply=s.ply + 1, repetition=dict(s.repetition))
+
+        if ENABLE_THREEFOLD_REPETITION_DRAW:
+            key = board_hash(next_state.board, next_state.side_to_move)
+            next_state.repetition[key] = next_state.repetition.get(key, 0) + 1
+
+        info = terminal_info(
+            next_state.board,
+            next_state.side_to_move,
+            next_state.repetition,
+            next_state.ply,
+            self.max_plies,
+        )
+        done = info.status != TerminalStatus.ONGOING
+
+        reward = 0.0
+        if done:
+            if info.status == TerminalStatus.DRAW:
+                reward = 0.0
+            else:
+                winner = info.winner
+                reward = 1.0 if winner == s.side_to_move else -1.0
+
+        self.state = next_state
+        return next_state.clone(), reward, done, info
+
+    def _step_cpp(self, mv: Move) -> Tuple[GameState, float, bool, GameInfo]:
+        """One step of the env, with the C++ engine as the authoritative board.
+
+        We keep two parallel board objects on this path. ``self._cpp_board`` is
+        the one we mutate (apply_move, repetition hash, terminal_info all run
+        in C++). The Python ``Board`` we hand back inside ``GameState`` is
+        re-built from the C++ board each step and is only used by the neural
+        encoder, which still wants a Python object. Repetition keys come from
+        the C++ board hash too, so the Python and C++ paths agree on what
+        counts as the same position.
+        """
+        s = self.state
+        moving_side = s.side_to_move
+
+        cpp_mv = _py_to_cpp_move(mv)
+        self._cpp_board = _cpp_module.apply_move(self._cpp_board, cpp_mv)
+
+        next_py_side = moving_side.opponent()
+        self._cpp_side = _PY_TO_CPP_SIDE[next_py_side]
+
+        # Rebuild a Python board only because the NN encoder needs one. The C++
+        # board is what the next call into apply_move / terminal_info will see.
+        py_board = _sync_to_py(self._cpp_board)
+
+        # Build next GameState
+        next_state = GameState(
+            board=py_board,
+            side_to_move=next_py_side,
+            ply=s.ply + 1,
+            repetition=dict(s.repetition),
+        )
+
+        # Repetition tracking using C++ hash
+        if ENABLE_THREEFOLD_REPETITION_DRAW:
+            key = self._cpp_board.board_hash(self._cpp_side)
+            next_state.repetition[key] = next_state.repetition.get(key, 0) + 1
+
+        # Terminal detection via C++
+        cpp_info = _cpp_module.terminal_info(
+            self._cpp_board, self._cpp_side,
+            next_state.repetition, next_state.ply, self.max_plies,
+        )
+
+        # Convert C++ GameInfo → Python GameInfo
+        status = cpp_info.status  # string, same values
+        done = status != TerminalStatus.ONGOING
+
+        winner = None
+        if cpp_info.winner == 1:
+            winner = Side.CHESS
+        elif cpp_info.winner == 2:
+            winner = Side.XIANGQI
+
+        info = GameInfo(status=status, winner=winner, reason=cpp_info.reason)
+
+        reward = 0.0
+        if done:
+            if status == TerminalStatus.DRAW:
+                reward = 0.0
+            else:
+                reward = 1.0 if winner == moving_side else -1.0
+
+        self.state = next_state
+        return next_state.clone(), reward, done, info
